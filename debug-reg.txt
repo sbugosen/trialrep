@@ -1,0 +1,380 @@
+using SparseArrays
+using Gurobi
+using HiGHS
+using JuMP
+using JSON
+import Ipopt
+import MathOptSymbolicAD
+import MathProgIncidence
+import MathOptInterface as MOI
+
+include("get-grad-lag.jl")
+
+# This is specified relative to this file's location
+include("../ac-uc-solver-000.jl")
+
+# These are specified relative to the working directory
+#problem_file = "../goc-c3-datasets/E3/D2/C3E3N08316D2/scenario_001.json"
+#solution_file = "./solutions/C3E3N08316D2sc001.json"
+#problem_file = "../goc-c3-datasets/E3/D2/C3E3N04224D2/scenario_131.json"
+#solution_file = "./solutions/C3E3N04224D2sc131.json"
+problem_file = "../goc-c3-datasets/C3S0_20221208/D2/C3S0N00003/scenario_003.json"
+solution_file = "./solutions/C3S0N00003D2sc003.json"
+
+# This is here just so I can see what options I was using
+#args = Dict(
+#    "case"=>problem_file,
+#    "solution_file"=>solution_file,
+#    "mip_optimizer"=>mip_optimizer,
+#    "linear_solver"=>"ma27",
+#    "scheduler_time_limit"=>300,
+#    "sequential_opf"=>false,
+#    "parallel_opf"=>true,
+#    "resolve_rounded_shunts"=>false,
+#    "warmstart_mip"=>true,
+#    "schedule_close_to_initial"=>false,
+#    "post_parallel_sequential"=>false,
+#    "relax_copperplate_balances"=>true,
+#    "include_reserves"=>true,
+#);
+
+input_data = get_data_from_file(problem_file)
+
+USE_CACHED_DATA = false
+
+if USE_CACHED_DATA
+    json_sched_data = open("_schedule_data.json", "r") do io
+        JSON.parse(io)
+    end
+    schedule_data = (
+        on_status = json_sched_data["on_status"],
+        real_power = json_sched_data["real_power"],
+    )
+else
+    #const GRBENV = Gurobi.Env(); gurobi = () -> Gurobi.Optimizer(GRBENV)
+    #mip_optimizer = gurobi
+    mip_optimizer = HiGHS.Optimizer
+    schedule_model, schedule_data = schedule_power_copperplate(
+        input_data;
+        optimizer=mip_optimizer,
+        relax_balances=false,
+        include_reserves=true,
+    )
+end
+
+sdd_ids = input_data.sdd_ids
+on_status = schedule_data.on_status
+real_power = schedule_data.real_power
+
+tightened_data = tighten_bounds_using_ramp_limits(
+    input_data, on_status, real_power
+)
+
+interval = 1
+
+interval_on_status = Dict(uid => on_status[uid][interval] for uid in sdd_ids)
+interval_real_power = Dict(uid => real_power[uid][interval] for uid in sdd_ids)
+
+args = Dict{String, Any}(
+    "on_status" => interval_on_status,
+    "real_power" => interval_real_power,
+    "penalize_power_deviation" => true,
+    "relax_power_balance" => true,
+    "relax_p_balance" => true,
+    "relax_q_balance" => true,
+    "fix_real_power" => false,
+    "allow_switching" => true,
+    "fix_shunt_steps" => true,
+)
+
+model = get_ac_opf_model(
+    tightened_data,
+    interval;
+    args = args,
+)
+
+optimizer = JuMP.optimizer_with_attributes(
+    Ipopt.Optimizer,
+    "honor_original_bounds" => "yes",
+    "tol" => 1e-6,
+    "linear_solver" => "ma27",
+    #"acceptable_tol" => 1e-4,
+)
+
+JuMP.set_optimizer(model, optimizer)
+
+# To get rid of overconstrained block with "dangling buses"
+#JuMP.delete_upper_bound(model[:vm]["bus_1260"])
+
+JuMP.optimize!(
+    model,
+    _differentiation_backend = MathOptSymbolicAD.DefaultBackend(),
+)
+
+igraph = MathProgIncidence.IncidenceGraphInterface(model)
+con_dmp, var_dmp = MathProgIncidence.dulmage_mendelsohn(igraph)
+
+oc_var = var_dmp.overconstrained
+oc_con = cat(con_dmp.overconstrained, con_dmp.unmatched, dims = 1)
+
+println("Variables/constraints in overconstrained system")
+println("(Equality constraints only)")
+for var in oc_var
+    println("  $var")
+end
+for con in oc_con
+    println("  $con")
+end
+println("-----------------------------------------------")
+
+function dm_with_active_set(model; tolerance=0.0)
+    eqs = MathProgIncidence.get_equality_constraints(model)
+    active_ineqs = MathProgIncidence.get_active_inequality_constraints(model; tolerance=tolerance)
+    cons = cat(eqs, active_ineqs, dims = 1)
+    vars = MathProgIncidence.identify_unique_variables(cons)
+    con_dmp, var_dmp = MathProgIncidence.dulmage_mendelsohn(cons, vars)
+    return con_dmp, var_dmp
+end
+
+# Lagrangian:
+# f(x) + \lambda^Tc(x) + \nu_L^T(x - x_L) + \nu_U^T(x_U - x)
+
+#function get_gradient_of_lagrangian(model)
+#    ordered_variables = all_variables(model)
+#    variable_values = value.(ordered_variables)
+#    n_var = length(ordered_variables)
+#    ordered_variable_indices = index.(ordered_variables)
+#
+#    nlp = MOI.Nonlinear.Model()
+#    constraint_indices = Any[]
+#    eq_constraint_indices = Any[]
+#    geq_constraint_indices = Any[]
+#    leq_constraint_indices = Any[]
+#    interval_constraint_indices = Any[]
+#    # TODO: Need to track the "eq", "geq", and "leq" positions
+#    idx = 0
+#    for (F, S) in list_of_constraint_types(model)
+#        if F <: VariableRef
+#            continue  # Skip variable bounds
+#        end
+#        for ci in all_constraints(model, F, S)
+#            idx += 1
+#            push!(constraint_indices, ci)
+#            object = constraint_object(ci)
+#            if S <: MOI.EqualTo
+#                push!(eq_constraint_indices, idx)
+#            end
+#            if S <: MOI.LessThan
+#                push!(leq_constraint_indices, idx)
+#            end
+#            if S <: MOI.GreaterThan
+#                push!(geq_constraint_indices, idx)
+#            end
+#            if S <: MOI.Interval
+#                push!(interval_constraint_indices, idx)
+#            end
+#            MOI.Nonlinear.add_constraint(nlp, object.func, object.set)
+#        end
+#    end
+#    MOI.Nonlinear.set_objective(nlp, objective_function(model))
+#
+#    eq_con_set = Set(eq_constraint_indices)
+#    eq_con_map = Dict([(orig_idx, proj_idx) for (proj_idx, orig_idx) in enumerate(eq_constraint_indices)])
+#    geq_con_set = Set(geq_constraint_indices)
+#    geq_con_map = Dict([(orig_idx, proj_idx) for (proj_idx, orig_idx) in enumerate(geq_constraint_indices)])
+#    leq_con_set = Set(leq_constraint_indices)
+#    leq_con_map = Dict([(orig_idx, proj_idx) for (proj_idx, orig_idx) in enumerate(leq_constraint_indices)])
+#    interval_con_set = Set(interval_constraint_indices)
+#    interval_con_map = Dict([(orig_idx, proj_idx) for (proj_idx, orig_idx) in enumerate(interval_constraint_indices)])
+#
+#    n_con = length(constraint_indices)
+#    n_eq_con = length(eq_constraint_indices)
+#    n_geq_con = length(geq_constraint_indices)
+#    n_leq_con = length(leq_constraint_indices)
+#    n_interval_con = length(interval_constraint_indices)
+#    println("N. constraints: $n_con")
+#    println("N. EQ constraints: $n_eq_con")
+#    println("N. GEQ constraints: $n_geq_con")
+#    println("N. LEQ constraints: $n_leq_con")
+#    println("N. interval constraints: $n_interval_con")
+#
+#    evaluator = MOI.Nonlinear.Evaluator(
+#        nlp,
+#        MOI.Nonlinear.SparseReverseMode(),
+#        ordered_variable_indices,
+#    )
+#    MOI.initialize(evaluator, [:Grad, :Jac, :Hess])
+#
+#    obj_grad = zeros(n_var)
+#    MOI.eval_objective_gradient(evaluator, obj_grad, variable_values)
+#
+#    con_jac_structure = MOI.jacobian_structure(evaluator)
+#    con_jac_nnz = length(con_jac_structure)
+#    con_jac_values = zeros(con_jac_nnz)
+#    MOI.eval_constraint_jacobian(evaluator, con_jac_values, variable_values)
+#
+#    # I'm identifying the rows in the Jacobian that correspond to these subsets.
+#    # But I need to convert them into the "projected spaces"
+#    eq_con_jac_rows = [eq_con_map[i] for (i, j) in con_jac_structure if i in eq_con_set]
+#    eq_con_jac_cols = [j for (i, j) in con_jac_structure if i in eq_con_set]
+#    eq_con_jac_values = [v for ((i, j), v) in zip(con_jac_structure, con_jac_values) if i in eq_con_set]
+#
+#    geq_con_jac_rows = [geq_con_map[i] for (i, j) in con_jac_structure if i in geq_con_set]
+#    geq_con_jac_cols = [j for (i, j) in con_jac_structure if i in geq_con_set]
+#    geq_con_jac_values = [v for ((i, j), v) in zip(con_jac_structure, con_jac_values) if i in geq_con_set]
+#
+#    leq_con_jac_rows = [leq_con_map[i] for (i, j) in con_jac_structure if i in leq_con_set]
+#    leq_con_jac_cols = [j for (i, j) in con_jac_structure if i in leq_con_set]
+#    leq_con_jac_values = [v for ((i, j), v) in zip(con_jac_structure, con_jac_values) if i in leq_con_set]
+#
+#    interval_con_jac_rows = [interval_con_map[i] for (i, j) in con_jac_structure if i in interval_con_set]
+#    interval_con_jac_cols = [j for (i, j) in con_jac_structure if i in interval_con_set]
+#    interval_con_jac_values = [v for ((i, j), v) in zip(con_jac_structure, con_jac_values) if i in interval_con_set]
+#
+#    eq_con_jac_csc = SparseArrays.sparse(
+#        eq_con_jac_rows,
+#        eq_con_jac_cols,
+#        eq_con_jac_values,
+#        n_eq_con,
+#        n_var,
+#    )
+#    geq_con_jac_csc = SparseArrays.sparse(
+#        geq_con_jac_rows,
+#        geq_con_jac_cols,
+#        geq_con_jac_values,
+#        n_geq_con,
+#        n_var,
+#    )
+#    leq_con_jac_csc = SparseArrays.sparse(
+#        leq_con_jac_rows,
+#        leq_con_jac_cols,
+#        leq_con_jac_values,
+#        n_leq_con,
+#        n_var,
+#    )
+#    interval_con_jac_csc = SparseArrays.sparse(
+#        interval_con_jac_rows,
+#        interval_con_jac_cols,
+#        interval_con_jac_values,
+#        n_interval_con,
+#        n_var,
+#    )
+#
+#    eq_constraint_duals = dual.([constraint_indices[i] for i in eq_constraint_indices])
+#    geq_constraint_duals = dual.([constraint_indices[i] for i in geq_constraint_indices])
+#    leq_constraint_duals = dual.([constraint_indices[i] for i in leq_constraint_indices])
+#    interval_constraint_duals = dual.([constraint_indices[i] for i in interval_constraint_indices])
+#
+#    ub_vars = Any[]
+#    ub_var_positions = Int[]
+#    lb_vars = Any[]
+#    lb_var_positions = Int[]
+#    fixed_vars = Any[]
+#    fixed_var_positions = Int[]
+#    for (i, var) in enumerate(ordered_variables)
+#        if has_upper_bound(var)
+#            push!(ub_vars, var)
+#            push!(ub_var_positions, i)
+#        end
+#        if has_lower_bound(var)
+#            push!(lb_vars, var)
+#            push!(lb_var_positions, i)
+#        end
+#        if is_fixed(var)
+#            push!(fixed_vars, var)
+#            push!(fixed_var_positions, i)
+#        end
+#    end
+#    #ub_duals = dual.(ub_vars)
+#    #lb_duals = dual.(lb_vars)
+#    #ub_slacks = upper_bound.(ub_vars) .- value.(ub_vars)
+#    #lb_slacks = value.(lb_vars) .- lower_bound.(lb_vars)
+#
+#    # Vectors in the full space of variables
+#    ub_dual_full_space = zeros(n_var)
+#    lb_dual_full_space = zeros(n_var)
+#    fixed_dual_full_space = zeros(n_var)
+#    for (i, var) in zip(ub_var_positions, ub_vars)
+#        ub_dual_full_space[i] = dual(UpperBoundRef(var))
+#    end
+#    for (i, var) in zip(lb_var_positions, lb_vars)
+#        lb_dual_full_space[i] = dual(LowerBoundRef(var))
+#    end
+#    for (i, var) in zip(fixed_var_positions, fixed_vars)
+#        fixed_dual_full_space[i] = dual(FixRef(var))
+#    end
+#
+#    @assert(all(geq_constraint_duals .>= 0.0))
+#    @assert(all(leq_constraint_duals .<= 0.0))
+#    @assert(all(ub_dual_full_space .<= 0.0))
+#    @assert(all(lb_dual_full_space .>= 0.0))
+#
+#    # Need inequality duals
+#    grad_lag = (
+#        - obj_grad
+#        + transpose(eq_con_jac_csc) * eq_constraint_duals
+#        + transpose(geq_con_jac_csc) * geq_constraint_duals
+#        + transpose(leq_con_jac_csc) * leq_constraint_duals
+#        # Unclear what sign to use for interval constraints...
+#        + transpose(interval_con_jac_csc) * interval_constraint_duals
+#        + ub_dual_full_space
+#        + lb_dual_full_space
+#        + fixed_dual_full_space
+#    )
+#    return grad_lag
+#end
+
+#function get_hessian_of_lagrangian(model)
+#    # TODO: This is incomplete
+#    hess_lag_structure = MOI.hessian_lagrangian_structure(evaluator)
+#    hess_lag_nnz = length(hess_lag_structure)
+#    hess_lag_values = zeros(hess_lag_nnz)
+#    constraint_duals = dual.(constraint_indices)
+#    MOI.eval_hessian_lagrangian(
+#        evaluator,
+#        hess_lag_values,
+#        variable_values,
+#        1.0,
+#        constraint_duals,
+#    )
+#    hess_lag_rows = [i for (i, j) in hess_lag_structure]
+#    hess_lag_cols = [j for (i, j) in hess_lag_structure]
+#    hess_lag_csc = SparseArrays.sparse(
+#        hess_lag_rows,
+#        hess_lag_cols,
+#        hess_lag_values,
+#        n_con,
+#        n_var,
+#    )
+#end
+
+function get_kkt_matrix(model)
+end
+
+grad_lag = get_gradient_of_lagrangian(model, verbose=true)
+
+# TODO: Assemble Hessian-of-Lagrangian
+# Here we have the solution.
+# Should be able to construct the Lagrangian using JuMP's dual convention.
+
+#con_dmp, var_dmp = dm_with_active_set(model, tolerance=1e-8)
+
+# This gives me an OverflowError?
+#oc_con = [con_dmp.overconstrained..., con_dmp.unmatched...]
+#oc_con = cat(con_dmp.overconstrained, con_dmp.unmatched, dims = 1)
+#oc_var = var_dmp.overconstrained
+#
+#oc_con_blocks, oc_var_blocks = MathProgIncidence.connected_components(oc_con, oc_var)
+
+#for (i,(cb, vb)) in enumerate(zip(oc_con_blocks, oc_var_blocks))
+#    println("Block $i")
+#    println("---------")
+#    println("Constraints")
+#    for c in cb
+#        println("  $c")
+#    end
+#    println("Variables")
+#    for v in vb
+#        println("  $v")
+#    end
+#end
