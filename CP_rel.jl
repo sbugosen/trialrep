@@ -1,11 +1,11 @@
 import PowerModels
-import Ipopt
+#import Ipopt
 import JuMP
 import DataFrames
 import CSV
 using JuMP
 using PowerModels
-using Ipopt
+#using Ipopt
 using DataFrames
 using CSV
 
@@ -22,37 +22,23 @@ function build_cp_opf(data::Dict{String,Any}, model=Model())
     @variable(model, ref[:gen][i]["pmin"] <= pg[i in keys(ref[:gen])] <= ref[:gen][i]["pmax"])
     @variable(model, ref[:gen][i]["qmin"] <= qg[i in keys(ref[:gen])] <= ref[:gen][i]["qmax"])
     
-    @objective(model, Min,
-        sum(gen["cost"][1]*pg[i]^2 + gen["cost"][2]*pg[i] + gen["cost"][3] for (i,gen) in ref[:gen])
-        #+sum(dcline["cost"][1]*p_dc[from_idx[i]]^2 + dcline["cost"][2]*p_dc[from_idx[i]] + dcline["cost"][3] for (i,dcline) in ref[:dcline])
-    )
-    #@objective(model, Max, sum(pg[i] for (i,gen) in ref[:gen])+ sum(qg[i] for (i,gen) in ref[:gen]))    
+    #@objective(model, Min,
+    #    sum(gen["cost"][1]*pg[i]^2 + gen["cost"][2]*pg[i] + gen["cost"][3] for (i,gen) in ref[:gen])
+    #    #+sum(dcline["cost"][1]*p_dc[from_idx[i]]^2 + dcline["cost"][2]*p_dc[from_idx[i]] + dcline["cost"][3] for (i,dcline) in ref[:dcline])
+    #)
+
+    @objective(model, Max, sum(pg[i] for (i,gen) in ref[:gen]) + sum(qg[i] for (i,gen) in ref[:gen]))    
     @variable(model, -Inf <= p[(l,i,j) in ref[:arcs]] <= Inf)
     @variable(model, -Inf <= q[(l,i,j) in ref[:arcs]] <= Inf)    
     
     bus_loads = [try ref[:load][l] catch error; nothing end for l = 1:length(ref[:bus_loads])]
     generators = reduce(vcat, [value for (key,value) in ref[:bus_gens] if !isempty(value)])
     
-    sum_cos_phi = 0
-    sum_sin_phi = 0
-    sum_cos_d = 0
-    
-    for (k,branch) in ref[:branch]
-        i,j = branch["f_bus"], branch["t_bus"]
-        buspair = ref[:buspairs][i,j]
-        tdub = buspair["angmax"]
-        tdlb = buspair["angmin"]
-        phi = (tdub+tdlb)/2
-        d = (tdub-tdlb)/2
-        sum_cos_phi = sum_cos_phi + cos(phi)
-        sum_sin_phi = sum_sin_phi + sin(phi)
-        sum_cos_d = sum_cos_d + cos(d)
-    end
+    A1 = Dict()
+    B1 = Dict()
+    A2 = Dict()
+    B2 = Dict()
 
-    A5 = Dict()
-    B5 = Dict()
-    A6 = Dict()
-    B6 = Dict()
     for (k,branch) in ref[:branch]
         i,j = branch["f_bus"], branch["t_bus"]
         f_idx = (k, branch["f_bus"], branch["t_bus"])
@@ -97,49 +83,40 @@ function build_cp_opf(data::Dict{String,Any}, model=Model())
         sf = vflb + vfub
         st = vtlb + vtub
 
-        A5[i,j] = (
+        A1[i,j] = -resis_fr*(
                    (vfub*vtub * cos(d) * (vflb*vtlb - vfub*vtub) + vtub*cos(d)*st*w_fr + vfub*cos(d)*sf*w_to) / (sf * st)
                    - w_fr
         )
-        # TODO: This constraint should be outside of the loop
-        #@constraint(model,
-        #    sum(pg[g] for g in generators) -
-        #    sum(load["pd"] for load in bus_loads if load !== nothing) <= sum(A5[i,j] for (i,j) in ref[:buspairs])
-        #)
 
-        # Bus KCL
-        @constraint(model,
-            sum(pg[g] for g in generators) -
-            sum(load["pd"] for load in bus_loads if load !== nothing) <= - ((((vfub*vtub*sum_cos_d*(vflb*vtlb - vfub*vtub) + vtub*sum_cos_d*st*w_fr + vfub*sum_cos_d*sf*w_to) / (sf*st)) - w_fr*sum_cos_phi - (-resis_to*q_to + reac_to*p_to)*(sum_sin_phi - sum_cos_phi)) / (resis_fr*sum_cos_phi)) - ((((vtub*vfub*sum_cos_d*(vtlb*vflb - vtub*vfub) + vfub*sum_cos_d*sf*w_to + vtub*sum_cos_d*st*w_fr) / (st*sf)) - w_to*sum_cos_phi - (-resis_fr*q_fr + reac_fr*p_fr)*(sum_sin_phi - sum_cos_phi)) / (resis_to*sum_cos_phi))
-         )
-        
-#        @constraint(model,
-#            sum(pg[g] for g in generators) -
-#            sum(load["pd"] for load in bus_loads if load !== nothing) <=  resis_fr*((((vfub*vtub*sum_cos_d*(vflb*vtlb - vfub*vtub) + vtub*sum_cos_d*st*w_fr + vfub*sum_cos_d*sf*w_to) / (sf*st)) - w_fr) - resis_to*((((vtub*vfub*sum_cos_d*(vtlb*vflb - vtub*vfub) + vfub*sum_cos_d*sf*w_to + vtub*sum_cos_d*st*w_fr) / (st*sf)) - w_to))))
-#
-        @constraint(model,
-            sum(qg[g] for g in generators) -
-            sum(load["qd"] for load in bus_loads if load !== nothing) >= - ((((vfub*vtub*sum_cos_d*(vflb*vtlb - vfub*vtub) + vtub*sum_cos_d*st*w_fr + vfub*sum_cos_d*sf*w_to) / (sf*st)) - w_fr*sum_cos_phi - (-resis_to*q_to + reac_to*p_to)*(sum_sin_phi - sum_cos_phi)) / (reac_fr*sum_cos_phi)) - ((((vtub*vfub*sum_cos_d*(vtlb*vflb - vtub*vfub) + vfub*sum_cos_d*sf*w_to + vtub*sum_cos_d*st*w_fr) / (st*sf)) - w_to*sum_cos_phi - (-resis_fr*q_fr + reac_fr*p_fr)*(sum_sin_phi - sum_cos_phi)) / (reac_to*sum_cos_phi))
+        B1[i,j] = -resis_to*(
+                   (vtub*vfub * cos(d) * (vtlb*vflb - vtub*vfub) + vfub*cos(d)*sf*w_to + vtub*cos(d)*st*w_fr) / (st * sf)
+                   - w_to
         )
-        
-        #@constraint(model,
-        #    sum(pg[g] for g in generators) -
-        #    sum(load["pd"] for load in bus_loads if load !== nothing) <= - ((((vflb*vtlb*sum_cos_d*(vfub*vtub - vflb*vtlb) + vtlb*sum_cos_d*st*w_fr + vflb*sum_cos_d*sf*w_to) / (sf*st)) - w_fr*sum_cos_phi - (-resis_to*q_to + reac_to*p_to)*(sum_sin_phi - sum_cos_phi)) / (resis_fr*sum_cos_phi)) - ((((vtlb*vflb*sum_cos_d*(vtub*vfub - vtlb*vflb) + vflb*sum_cos_d*sf*w_to + vtlb*sum_cos_d*st*w_fr) / (st*sf)) - w_to*sum_cos_phi - (-resis_fr*q_fr + reac_fr*p_fr)*(sum_sin_phi - sum_cos_phi)) / (resis_to*sum_cos_phi))
-        #)
 
-        #@constraint(model,
-        #    sum(pg[g] for g in generators) -
-        #    sum(load["pd"] for load in bus_loads if load !== nothing) <=  resis_fr*((((vflb*vtlb*sum_cos_d*(vfub*vtub - vflb*vtlb) + vtlb*sum_cos_d*st*w_fr + vflb*sum_cos_d*sf*w_to) / (sf*st)) - w_fr) - resis_to*((((vtlb*vflb*sum_cos_d*(vtub*vfub - vtlb*vflb) + vflb*sum_cos_d*sf*w_to + vtlb*sum_cos_d*st*w_fr) / (st*sf)) - w_to))))
-        #
+        A2[i,j] = -resis_fr*(
+                   (vflb*vtlb * cos(d) * (vfub*vtub - vflb*vtlb) + vtlb*cos(d)*st*w_fr + vflb*cos(d)*sf*w_to) / (sf * st)
+                   - w_fr
+        )
 
-        @constraint(model,
-            sum(qg[g] for g in generators) -
-            sum(load["qd"] for load in bus_loads if load !== nothing) >= - ((((vflb*vtlb*sum_cos_d*(vfub*vtub - vflb*vtlb) + vtlb*sum_cos_d*st*w_fr + vflb*sum_cos_d*sf*w_to) / (sf*st)) - w_fr*sum_cos_phi - (-resis_to*q_to + reac_to*p_to)*(sum_sin_phi - sum_cos_phi)) / (reac_fr*sum_cos_phi)) - ((((vtlb*vflb*sum_cos_d*(vtub*vfub - vtlb*vflb) + vflb*sum_cos_d*sf*w_to + vtlb*sum_cos_d*st*w_fr) / (st*sf)) - w_to*sum_cos_phi - (-resis_fr*q_fr + reac_fr*p_fr)*(sum_sin_phi - sum_cos_phi)) / (reac_to*sum_cos_phi))
+        B2[i,j] = -resis_to*(
+                   (vtlb*vflb * cos(d) * (vtub*vfub - vtlb*vflb) + vflb*cos(d)*sf*w_to + vtlb*cos(d)*st*w_fr) / (st * sf)
+                   - w_to
         )
 
     end
-    
-    # Bus KCL
+   
+    #@constraint(model,
+    #            sum(pg[g] for g in generators) -
+    #            sum(load["pd"] for load in bus_loads if load !== nothing) <= sum(A1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
+    #            + sum(B1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
+    #)
+
+    #@constraint(model,
+    #            sum(pg[g] for g in generators) -
+    #            sum(load["pd"] for load in bus_loads if load !== nothing) <= sum(A2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
+    #            + sum(B2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
+    #)
+
     @constraint(model,
                 sum(pg[g] for g in generators) -
                 sum(load["pd"] for load in bus_loads if load !== nothing) >= 0 
@@ -153,24 +130,31 @@ function build_cp_opf(data::Dict{String,Any}, model=Model())
    return model
 end
 
-#obj_vals = Vector{Float64}()
-#term_st  = Vector()
-#times = Vector{Float64}()
-#files2 = joinpath.(abspath("sad"), readdir("sad"))
-#
-#for file in files2
-data = PowerModels.parse_file("/nh/nest/u/sbugosen/Repositories/trialrep/sad/pglib_opf_case14_ieee__sad.m")
-model = Model(Ipopt.Optimizer)
-JuMP.set_optimizer_attribute(model, "linear_solver", "ma27")
-build_cp_opf(data, model)
-optimize!(model)
-#    time = JuMP.solve_time(model)
-#    push!(times, time)
-#    push!(obj_vals, (JuMP.objective_value(model)))
-#    push!(term_st, (JuMP.termination_status(model)))
-#end
-#
-#df = DataFrame(Datasets = readdir("sad"), Objective = obj_vals, Time = times, Termination = term_st)
-#CSV.write("cp_min_sad_lnc_new",df)
+import AmplNLWriter
+using AmplNLWriter
+#data = PowerModels.parse_file("pglib_opf_case73_ieee_rts.m")
+#model = Model(() -> AmplNLWriter.Optimizer("ipopt"))
+#build_cp_opf(data, model)
+#optimize!(model)
+
+
+obj_vals = Vector{Float64}()
+term_st  = Vector()
+times = Vector{Float64}()
+files2 = joinpath.(abspath("pglib-opf/sad"), readdir("pglib-opf/sad"))
+
+for file in files2
+    data = PowerModels.parse_file(file)
+    model = Model(() -> AmplNLWriter.Optimizer("ipopt"))
+    build_cp_opf(data, model)
+    optimize!(model)
+    time = JuMP.solve_time(model)
+    push!(times, time)
+    push!(obj_vals, (JuMP.objective_value(model)))
+    push!(term_st, (JuMP.termination_status(model)))
+end
+
+df = DataFrame(Datasets = readdir("pglib-opf/sad"), Objective = obj_vals, Time = times, Termination = term_st)
+CSV.write("cp_max_sad.csv",df)
  
 
