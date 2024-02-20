@@ -28,11 +28,17 @@ function build_cp_opf(data::Dict{String,Any}, model=Model())
     #)
 
     @objective(model, Max, sum(pg[i] for (i,gen) in ref[:gen]) + sum(qg[i] for (i,gen) in ref[:gen]))    
+
     @variable(model, -Inf <= p[(l,i,j) in ref[:arcs]] <= Inf)
     @variable(model, -Inf <= q[(l,i,j) in ref[:arcs]] <= Inf)    
     
     bus_loads = [try ref[:load][l] catch error; nothing end for l = 1:length(ref[:bus_loads])]
     generators = reduce(vcat, [value for (key,value) in ref[:bus_gens] if !isempty(value)])
+    bus_shunts = [try ref[:shunt][s] catch error; nothing end for s = 1:length(ref[:bus_shunts])]
+    bus_shunts_filtered = filter(x -> x !== nothing, bus_shunts)
+    shunts_gs = [shunt["gs"] for shunt in bus_shunts_filtered]
+    shunts_bs = [shunt["bs"] for shunt in bus_shunts_filtered]
+    buses = reduce(vcat, [key for (key,value) in ref[:bus_shunts] if !isempty(value)], init = [])
     
     A1 = Dict()
     B1 = Dict()
@@ -105,26 +111,32 @@ function build_cp_opf(data::Dict{String,Any}, model=Model())
 
     end
    
-    #@constraint(model,
-    #            sum(pg[g] for g in generators) -
-    #            sum(load["pd"] for load in bus_loads if load !== nothing) <= sum(A1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
-    #            + sum(B1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
-    #)
-
-    #@constraint(model,
-    #            sum(pg[g] for g in generators) -
-    #            sum(load["pd"] for load in bus_loads if load !== nothing) <= sum(A2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
-    #            + sum(B2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
-    #)
+    @constraint(model,
+                sum(pg[g] for g in generators) -
+                sum(load["pd"] for load in bus_loads if load !== nothing) - 
+                sum(shunts_gs[i]*w[buses[i]] for i in 1:length(shunts_gs)) 
+                <= sum(A1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
+                + sum(B1[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
+    )
 
     @constraint(model,
                 sum(pg[g] for g in generators) -
-                sum(load["pd"] for load in bus_loads if load !== nothing) >= 0 
+                sum(load["pd"] for load in bus_loads if load !== nothing) -
+                sum(shunts_gs[i]*w[buses[i]] for i in 1:length(shunts_gs))
+                <= sum(A2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch]) 
+                + sum(B2[branch["f_bus"],branch["t_bus"]] for (k,branch) in ref[:branch])
+    )
+
+    @constraint(model,
+                sum(pg[g] for g in generators) -
+                sum(load["pd"] for load in bus_loads if load !== nothing) - 
+                sum(shunts_gs[i]*w[buses[i]] for i in 1:length(shunts_gs)) >= 0 
                )
 
     @constraint(model,
                 sum(qg[g] for g in generators) -
-                sum(load["qd"] for load in bus_loads if load !== nothing) >= 0 
+                sum(load["qd"] for load in bus_loads if load !== nothing) + 
+                sum(shunts_bs[i]*w[buses[i]] for i in 1:length(shunts_bs)) >= 0 
                )
     
    return model
@@ -132,7 +144,7 @@ end
 
 import AmplNLWriter
 using AmplNLWriter
-#data = PowerModels.parse_file("pglib_opf_case73_ieee_rts.m")
+#data = PowerModels.parse_file("/Users/sbugosen/Repositories/trialrep/pglib-opf/sad/pglib_opf_case10192_epigrids__sad.m")
 #model = Model(() -> AmplNLWriter.Optimizer("ipopt"))
 #build_cp_opf(data, model)
 #optimize!(model)
@@ -155,6 +167,6 @@ for file in files2
 end
 
 df = DataFrame(Datasets = readdir("pglib-opf/sad"), Objective = obj_vals, Time = times, Termination = term_st)
-CSV.write("cp_max_sad.csv",df)
+CSV.write("cp_max_sad_lnc_FINAL_shunts.csv",df)
  
 
